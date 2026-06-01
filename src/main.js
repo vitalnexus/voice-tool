@@ -72,7 +72,7 @@ async function verifyAudioDevices() {
   }
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await requestAudioStream();
     const devices = await navigator.mediaDevices.enumerateDevices();
     const hasMicrophone = devices.some((device) => device.kind === 'audioinput');
     const hasSpeakers = devices.some((device) => device.kind === 'audiooutput');
@@ -153,8 +153,16 @@ async function handleStartRecording() {
   }
 
   if (!state.stream.active) {
-    state.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    setupAudioMeter(state.stream);
+    try {
+      state.stream = await requestAudioStream();
+      setupAudioMeter(state.stream);
+    } catch (error) {
+      elements.recordingMessage.textContent = 'A working microphone could not be opened. Check your Chromium input device settings.';
+      elements.recordingState.textContent = 'Idle';
+      updateControlsAfterStop(false);
+      console.error(error);
+      return;
+    }
   }
 
   if (state.audioContext?.state === 'suspended') {
@@ -493,6 +501,28 @@ function getActiveRecording() {
   return state.recordings.find((entry) => entry.id === state.activeRecordingId) || null;
 }
 
+async function requestAudioStream() {
+  try {
+    return await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (error) {
+    if (error.name !== 'NotFoundError') {
+      throw error;
+    }
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const microphone = devices.find((device) => device.kind === 'audioinput' && device.deviceId);
+    if (!microphone) {
+      throw error;
+    }
+
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: { exact: microphone.deviceId },
+      },
+    });
+  }
+}
+
 function createWorkingMediaRecorder(stream) {
   const mimeType = pickMimeType();
 
@@ -809,7 +839,9 @@ function formatRecordingLabel(timestamp) {
 }
 
 function formatRecordingFilename(timestamp) {
-  return formatRecordingLabel(timestamp).replace(' ', '-');
+  return formatRecordingLabel(timestamp)
+    .replace(' ', '-')
+    .replace(':', '');
 }
 
 function padNumber(value) {
