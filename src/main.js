@@ -5,10 +5,16 @@ const DB_NAME = 'voice-tool-storage';
 const DB_VERSION = 1;
 const STORE_NAME = 'settings';
 const DIRECTORY_HANDLE_KEY = 'save-directory-handle';
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 const state = {
   stream: null,
   mediaRecorder: null,
+  speechRecognition: null,
+  transcriptSupported: Boolean(SpeechRecognition),
+  transcriptFinal: '',
+  transcriptInterim: '',
+  transcriptError: '',
   audioChunks: [],
   recordings: [],
   activeRecordingId: '',
@@ -37,6 +43,8 @@ const elements = {
   recordingMessage: document.querySelector('#recording-message'),
   recordingLength: document.querySelector('#recording-length'),
   meterBar: document.querySelector('#meter-bar'),
+  transcriptBox: document.querySelector('#transcript-box'),
+  transcriptStatus: document.querySelector('#transcript-status'),
   historyCount: document.querySelector('#history-count'),
   historyList: document.querySelector('#history-list'),
 };
@@ -45,6 +53,7 @@ initialize();
 
 async function initialize() {
   bindEvents();
+  initializeTranscription();
   await loadPersistedRecordings();
   await restoreSaveDirectoryHandle();
   renderHistory();
@@ -59,6 +68,66 @@ function bindEvents() {
   elements.saveButton.addEventListener('click', handleSaveRecording);
   elements.folderButton.addEventListener('click', handleChooseSaveFolder);
   elements.historyList.addEventListener('click', handleHistoryAction);
+}
+
+function initializeTranscription() {
+  if (!state.transcriptSupported) {
+    elements.transcriptStatus.textContent = 'Unsupported';
+    elements.transcriptBox.textContent = 'Live transcription is not available in this browser. Chromium usually supports it through the built-in speech recognition service.';
+    return;
+  }
+
+  state.speechRecognition = new SpeechRecognition();
+  state.speechRecognition.continuous = true;
+  state.speechRecognition.interimResults = true;
+  state.speechRecognition.lang = 'en-US';
+
+  state.speechRecognition.addEventListener('start', () => {
+    updateTranscriptStatus('Listening');
+  });
+
+  state.speechRecognition.addEventListener('result', (event) => {
+    let interimTranscript = '';
+    for (let index = event.resultIndex; index < event.results.length; index += 1) {
+      const result = event.results[index];
+      const text = result[0].transcript.trim();
+      if (!text) {
+        continue;
+      }
+
+      if (result.isFinal) {
+        state.transcriptFinal = `${state.transcriptFinal} ${text}`.trim();
+      } else {
+        interimTranscript = `${interimTranscript} ${text}`.trim();
+      }
+    }
+
+    state.transcriptInterim = interimTranscript;
+    renderTranscript();
+  });
+
+  state.speechRecognition.addEventListener('error', (event) => {
+    state.transcriptError = event.error;
+    updateTranscriptStatus('Error');
+    renderTranscript();
+  });
+
+  state.speechRecognition.addEventListener('end', () => {
+    if (state.mediaRecorder?.state === 'recording') {
+      try {
+        state.speechRecognition.start();
+      } catch (error) {
+        state.transcriptError = error.message;
+        updateTranscriptStatus('Error');
+        renderTranscript();
+      }
+      return;
+    }
+
+    updateTranscriptStatus(state.transcriptFinal ? 'Ready' : 'Idle');
+  });
+
+  updateTranscriptStatus('Ready');
 }
 
 async function verifyAudioDevices() {
@@ -170,6 +239,7 @@ async function handleStartRecording() {
   }
 
   resetSelectedRecording();
+  resetTranscript();
 
   state.audioChunks = [];
   state.recordingStartedAt = Date.now();
@@ -201,7 +271,7 @@ async function handleStartRecording() {
     const durationMs = Date.now() - state.recordingStartedAt;
     const startedAt = state.recordingStartedAt;
     const blob = new Blob(state.audioChunks, { type: state.mediaRecorder.mimeType });
-    const recording = createRecordingEntry(blob, startedAt, durationMs);
+    const recording = createRecordingEntry(blob, startedAt, durationMs, state.transcriptFinal);
 
     state.recordings.unshift(recording);
     selectRecording(recording.id);
@@ -213,6 +283,7 @@ async function handleStartRecording() {
 
   try {
     startMediaRecorder(state.mediaRecorder);
+    startTranscription();
     elements.recordingState.textContent = 'Recording';
     elements.recordingMessage.textContent = 'Recording in progress. Press stop when you want to finish.';
     elements.startButton.disabled = true;
@@ -232,13 +303,21 @@ async function handleStartRecording() {
 function handleStopRecording() {
   if (state.mediaRecorder?.state === 'recording') {
     state.mediaRecorder.stop();
+    stopTranscription();
     elements.recordingState.textContent = 'Stopped';
     elements.stopButton.disabled = true;
   }
 }
 
-function handlePlayRecording() {
-  if (!state.recordedUrl) {
+async function handlePlayRecording() {
+  const activeRecording = getActiveRecording();
+  if (!state.recordedUrl || !activeRecording) {
+    return;
+  }
+
+  const verification = await verifyRecordingFiles(activeRecording);
+  if (!verification.ok) {
+    elements.recordingMessage.textContent = verification.message;
     return;
   }
 
@@ -270,20 +349,43 @@ async function handleSaveRecording() {
   }
 
   try {
-    const wavBlob = await convertBlobToWav(state.recordedBlob);
-    const fileName = `${getActiveRecording().fileLabel}.wav`;
-    const directoryHandle = await ensureSaveDirectoryHandle();
-
-    if (directoryHandle) {
-      await saveRecordingToFolder(fileName, wavBlob);
-      elements.recordingMessage.textContent = `Saved ${fileName} to ${directoryHandle.name}.`;
+    const activeRecording = getActiveRecording();
+    if (!activeRecording) {
       return;
     }
 
-    downloadRecording(fileName, wavBlob);
-    elements.recordingMessage.textContent = `Saved ${fileName} to your browser downloads folder.`;
+    const wavBlob = await convertBlobToWav(state.recordedBlob);
+    const wavFileName = `${activeRecording.fileLabel}.wav`;
+    const textFileName = `${activeRecording.fileLabel}.txt`;
+    const textBlob = new Blob([activeRecording.transcript || ''], { type: 'text/plain;charset=utf-8' });
+    const directoryHandle = await ensureSaveDirectoryHandle();
+
+    if (directoryHandle) {
+      await saveBlobToFolder(wavFileName, wavBlob);
+      await saveBlobToFolder(textFileName, textBlob);
+      activeRecording.savedFiles = {
+        wavFileName,
+        textFileName,
+        locationType: 'directory',
+        folderName: directoryHandle.name,
+      };
+      await persistRecordings();
+      elements.recordingMessage.textContent = `Saved ${wavFileName} and ${textFileName} to ${directoryHandle.name}.`;
+      return;
+    }
+
+    downloadRecording(wavFileName, wavBlob);
+    downloadRecording(textFileName, textBlob);
+    activeRecording.savedFiles = {
+      wavFileName,
+      textFileName,
+      locationType: 'download',
+      folderName: 'Browser downloads folder',
+    };
+    await persistRecordings();
+    elements.recordingMessage.textContent = `Saved ${wavFileName} and ${textFileName} to your browser downloads folder.`;
   } catch (error) {
-    elements.recordingMessage.textContent = 'WAV export failed in this browser.';
+    elements.recordingMessage.textContent = 'Saving the WAV and TXT files failed in this browser.';
     console.error(error);
   }
 }
@@ -357,6 +459,7 @@ function clearRecording() {
   elements.playbackAudio.removeAttribute('src');
   elements.playbackAudio.load();
   elements.recordingLength.textContent = 'No recording yet';
+  clearTranscriptDisplay();
   elements.playButton.disabled = true;
   elements.deleteButton.disabled = true;
   elements.saveButton.disabled = true;
@@ -370,6 +473,7 @@ function resetSelectedRecording() {
   elements.playbackAudio.removeAttribute('src');
   elements.playbackAudio.load();
   elements.recordingLength.textContent = 'No recording yet';
+  clearTranscriptDisplay();
   elements.playButton.disabled = true;
   elements.deleteButton.disabled = true;
   elements.saveButton.disabled = true;
@@ -399,7 +503,9 @@ function handleHistoryAction(event) {
     });
     elements.recordingMessage.textContent = 'Playing a recording from history.';
     updateControlsAfterStop(true);
-    handlePlayRecording();
+    handlePlayRecording().catch((error) => {
+      console.error(error);
+    });
     return;
   }
 
@@ -413,7 +519,7 @@ function handleHistoryAction(event) {
   }
 }
 
-function createRecordingEntry(blob, startedAt, durationMs) {
+function createRecordingEntry(blob, startedAt, durationMs, transcript = '') {
   const id = `${startedAt}-${crypto.randomUUID()}`;
   const url = URL.createObjectURL(blob);
 
@@ -426,6 +532,8 @@ function createRecordingEntry(blob, startedAt, durationMs) {
     displayName: formatRecordingLabel(startedAt),
     fileLabel: formatRecordingFilename(startedAt),
     durationLabel: formatDuration(durationMs),
+    transcript,
+    savedFiles: null,
   };
 }
 
@@ -442,6 +550,10 @@ function selectRecording(id) {
   state.recordedUrl = recording.url;
   elements.playbackAudio.src = recording.url;
   elements.recordingLength.textContent = recording.durationLabel;
+  showTranscript(recording.transcript);
+  if (recording.savedFiles) {
+    elements.recordingMessage.textContent = `Saved files: ${recording.savedFiles.wavFileName} and ${recording.savedFiles.textFileName}.`;
+  }
   renderHistory();
 }
 
@@ -569,6 +681,8 @@ async function loadPersistedRecordings() {
           displayName: formatRecordingLabel(recording.startedAt),
           fileLabel: formatRecordingFilename(recording.startedAt),
           durationLabel: formatDuration(recording.durationMs),
+          transcript: recording.transcript || '',
+          savedFiles: recording.savedFiles || null,
         };
       }),
     );
@@ -598,6 +712,8 @@ async function persistRecordings() {
       id: recording.id,
       startedAt: recording.startedAt,
       durationMs: recording.durationMs,
+      transcript: recording.transcript || '',
+      savedFiles: recording.savedFiles || null,
       dataUrl: await blobToDataUrl(recording.blob),
     })),
   );
@@ -611,11 +727,73 @@ async function persistRecordings() {
   );
 }
 
-async function saveRecordingToFolder(fileName, wavBlob) {
+async function saveBlobToFolder(fileName, blob) {
   const fileHandle = await state.saveDirectoryHandle.getFileHandle(fileName, { create: true });
   const writable = await fileHandle.createWritable();
-  await writable.write(wavBlob);
+  await writable.write(blob);
   await writable.close();
+}
+
+async function verifyRecordingFiles(recording) {
+  if (!recording.savedFiles) {
+    return {
+      ok: false,
+      message: 'Playback is blocked because this recording has not been saved as both WAV and TXT files yet.',
+    };
+  }
+
+  if (recording.savedFiles.locationType !== 'directory') {
+    return {
+      ok: false,
+      message: 'Playback is blocked because browser-download files cannot be verified for both WAV and TXT existence.',
+    };
+  }
+
+  if (!state.saveDirectoryHandle) {
+    return {
+      ok: false,
+      message: 'Playback is blocked because the saved folder is not currently available for WAV/TXT verification.',
+    };
+  }
+
+  const permission = await verifyDirectoryPermission(state.saveDirectoryHandle, false);
+  if (permission !== 'granted') {
+    return {
+      ok: false,
+      message: 'Playback is blocked because the app needs folder permission to verify the WAV and TXT files first.',
+    };
+  }
+
+  const missingFiles = [];
+  if (!(await fileExists(state.saveDirectoryHandle, recording.savedFiles.wavFileName))) {
+    missingFiles.push(recording.savedFiles.wavFileName);
+  }
+
+  if (!(await fileExists(state.saveDirectoryHandle, recording.savedFiles.textFileName))) {
+    missingFiles.push(recording.savedFiles.textFileName);
+  }
+
+  if (missingFiles.length > 0) {
+    return {
+      ok: false,
+      message: `Playback is blocked because these saved files do not exist: ${missingFiles.join(', ')}.`,
+    };
+  }
+
+  return { ok: true };
+}
+
+async function fileExists(directoryHandle, fileName) {
+  try {
+    await directoryHandle.getFileHandle(fileName);
+    return true;
+  } catch (error) {
+    if (error.name === 'NotFoundError') {
+      return false;
+    }
+
+    throw error;
+  }
 }
 
 async function restoreSaveDirectoryHandle() {
@@ -777,6 +955,65 @@ function renderMeter() {
 
   cancelAnimationFrame(state.meterFrame);
   update();
+}
+
+function startTranscription() {
+  if (!state.speechRecognition) {
+    updateTranscriptStatus('Unsupported');
+    return;
+  }
+
+  try {
+    state.speechRecognition.start();
+  } catch (error) {
+    state.transcriptError = error.message;
+    updateTranscriptStatus('Error');
+    renderTranscript();
+  }
+}
+
+function stopTranscription() {
+  if (!state.speechRecognition) {
+    return;
+  }
+
+  try {
+    state.speechRecognition.stop();
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function resetTranscript() {
+  state.transcriptFinal = '';
+  state.transcriptInterim = '';
+  state.transcriptError = '';
+  updateTranscriptStatus(state.speechRecognition ? 'Ready' : 'Unsupported');
+  renderTranscript();
+}
+
+function renderTranscript() {
+  if (state.transcriptError) {
+    elements.transcriptBox.textContent = `Transcription error: ${state.transcriptError}`;
+    return;
+  }
+
+  const transcript = [state.transcriptFinal, state.transcriptInterim].filter(Boolean).join(' ');
+  elements.transcriptBox.textContent = transcript || 'Listening for speech...';
+}
+
+function clearTranscriptDisplay() {
+  elements.transcriptBox.textContent = 'Transcription will appear here while you speak, or after the recording is complete.';
+  updateTranscriptStatus(state.speechRecognition ? 'Ready' : 'Unsupported');
+}
+
+function showTranscript(transcript) {
+  elements.transcriptBox.textContent = transcript || 'No transcript was captured for this recording.';
+  updateTranscriptStatus(transcript ? 'Ready' : state.speechRecognition ? 'Idle' : 'Unsupported');
+}
+
+function updateTranscriptStatus(status) {
+  elements.transcriptStatus.textContent = status;
 }
 
 async function convertBlobToWav(blob) {

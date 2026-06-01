@@ -44,6 +44,7 @@ audio {
 .hero,
 .status-card,
 .controls-card,
+.transcript-card,
 .playback-card,
 .history-card {
   background: rgba(15, 17, 23, 0.76);
@@ -91,6 +92,7 @@ h1 {
 
 .status-card,
 .controls-card,
+.transcript-card,
 .playback-card,
 .history-card {
   padding: 24px;
@@ -152,10 +154,21 @@ button:disabled {
 }
 
 .controls-card,
+.transcript-card,
 .playback-card,
 .history-card {
   display: grid;
   gap: 18px;
+}
+
+.transcript-box {
+  min-height: 132px;
+  padding: 18px;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(247, 243, 234, 0.84);
+  white-space: pre-wrap;
 }
 
 .save-destination {
@@ -265,6 +278,7 @@ audio {
   .hero,
   .status-card,
   .controls-card,
+  .transcript-card,
   .playback-card,
   .history-card {
     border-radius: 22px;

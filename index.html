@@ -45,6 +45,20 @@
           </p>
         </section>
 
+        <section class="transcript-card">
+          <div class="playback-header">
+            <div>
+              <p class="status-label">Transcript</p>
+              <h2>Speech to text</h2>
+            </div>
+            <span id="transcript-status" class="pill">Unavailable</span>
+          </div>
+
+          <div id="transcript-box" class="transcript-box" aria-live="polite">
+            Transcription will appear here while you speak, or after the recording is complete.
+          </div>
+        </section>
+
         <section class="playback-card">
           <div class="playback-header">
             <div>
@@ -67,7 +81,7 @@
           <div class="button-row compact">
             <button id="play-button" type="button" disabled>Play recording</button>
             <button id="delete-button" type="button" disabled>Delete recording</button>
-            <button id="save-button" type="button" disabled>Save as WAV</button>
+            <button id="save-button" type="button" disabled>Save WAV + TXT</button>
           </div>
 
           <p class="footnote">
