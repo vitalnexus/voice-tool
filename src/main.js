@@ -1,6 +1,10 @@
 import './style.css';
 
 const STORAGE_KEY = 'voice-tool-recordings';
+const DB_NAME = 'voice-tool-storage';
+const DB_VERSION = 1;
+const STORE_NAME = 'settings';
+const DIRECTORY_HANDLE_KEY = 'save-directory-handle';
 
 const state = {
   stream: null,
@@ -8,6 +12,7 @@ const state = {
   audioChunks: [],
   recordings: [],
   activeRecordingId: '',
+  saveDirectoryHandle: null,
   recordedBlob: null,
   recordedUrl: '',
   recordingStartedAt: 0,
@@ -25,6 +30,8 @@ const elements = {
   playButton: document.querySelector('#play-button'),
   deleteButton: document.querySelector('#delete-button'),
   saveButton: document.querySelector('#save-button'),
+  folderButton: document.querySelector('#folder-button'),
+  folderStatus: document.querySelector('#folder-status'),
   playbackAudio: document.querySelector('#playback-audio'),
   recordingState: document.querySelector('#recording-state'),
   recordingMessage: document.querySelector('#recording-message'),
@@ -39,6 +46,7 @@ initialize();
 async function initialize() {
   bindEvents();
   await loadPersistedRecordings();
+  await restoreSaveDirectoryHandle();
   renderHistory();
   await verifyAudioDevices();
 }
@@ -49,6 +57,7 @@ function bindEvents() {
   elements.playButton.addEventListener('click', handlePlayRecording);
   elements.deleteButton.addEventListener('click', handleDeleteRecording);
   elements.saveButton.addEventListener('click', handleSaveRecording);
+  elements.folderButton.addEventListener('click', handleChooseSaveFolder);
   elements.historyList.addEventListener('click', handleHistoryAction);
 }
 
@@ -143,20 +152,30 @@ async function handleStartRecording() {
     }
   }
 
+  if (!state.stream.active) {
+    state.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    setupAudioMeter(state.stream);
+  }
+
   if (state.audioContext?.state === 'suspended') {
     await state.audioContext.resume();
   }
 
   resetSelectedRecording();
 
-  const mimeType = pickMimeType();
-  state.mediaRecorder = mimeType
-    ? new MediaRecorder(state.stream, { mimeType })
-    : new MediaRecorder(state.stream);
-
   state.audioChunks = [];
   state.recordingStartedAt = Date.now();
   state.activeRecordingId = '';
+
+  try {
+    state.mediaRecorder = createWorkingMediaRecorder(state.stream);
+  } catch (error) {
+    elements.recordingMessage.textContent = 'Recording could not be started in this browser configuration.';
+    elements.recordingState.textContent = 'Idle';
+    updateControlsAfterStop(false);
+    console.error(error);
+    return;
+  }
 
   state.mediaRecorder.addEventListener('dataavailable', (event) => {
     if (event.data.size > 0) {
@@ -184,14 +203,22 @@ async function handleStartRecording() {
     updateControlsAfterStop(true);
   });
 
-  state.mediaRecorder.start(250);
-  elements.recordingState.textContent = 'Recording';
-  elements.recordingMessage.textContent = 'Recording in progress. Press stop when you want to finish.';
-  elements.startButton.disabled = true;
-  elements.stopButton.disabled = false;
-  elements.playButton.disabled = true;
-  elements.deleteButton.disabled = true;
-  elements.saveButton.disabled = true;
+  try {
+    startMediaRecorder(state.mediaRecorder);
+    elements.recordingState.textContent = 'Recording';
+    elements.recordingMessage.textContent = 'Recording in progress. Press stop when you want to finish.';
+    elements.startButton.disabled = true;
+    elements.stopButton.disabled = false;
+    elements.playButton.disabled = true;
+    elements.deleteButton.disabled = true;
+    elements.saveButton.disabled = true;
+  } catch (error) {
+    state.mediaRecorder = null;
+    elements.recordingMessage.textContent = 'Recording could not be started in this browser configuration.';
+    elements.recordingState.textContent = 'Idle';
+    updateControlsAfterStop(false);
+    console.error(error);
+  }
 }
 
 function handleStopRecording() {
@@ -236,15 +263,73 @@ async function handleSaveRecording() {
 
   try {
     const wavBlob = await convertBlobToWav(state.recordedBlob);
-    const exportUrl = URL.createObjectURL(wavBlob);
-    const link = document.createElement('a');
-    link.href = exportUrl;
-    link.download = `${getActiveRecording().fileLabel}.wav`;
-    link.click();
-    URL.revokeObjectURL(exportUrl);
+    const fileName = `${getActiveRecording().fileLabel}.wav`;
+    const directoryHandle = await ensureSaveDirectoryHandle();
+
+    if (directoryHandle) {
+      await saveRecordingToFolder(fileName, wavBlob);
+      elements.recordingMessage.textContent = `Saved ${fileName} to ${directoryHandle.name}.`;
+      return;
+    }
+
+    downloadRecording(fileName, wavBlob);
+    elements.recordingMessage.textContent = `Saved ${fileName} to your browser downloads folder.`;
   } catch (error) {
     elements.recordingMessage.textContent = 'WAV export failed in this browser.';
     console.error(error);
+  }
+}
+
+async function handleChooseSaveFolder() {
+  await promptForSaveDirectory();
+}
+
+async function ensureSaveDirectoryHandle() {
+  if (!window.showDirectoryPicker) {
+    elements.folderStatus.textContent = 'Direct folder access is not supported in this browser.';
+    return null;
+  }
+
+  if (state.saveDirectoryHandle) {
+    const permission = await verifyDirectoryPermission(state.saveDirectoryHandle, true);
+    if (permission === 'granted') {
+      return state.saveDirectoryHandle;
+    }
+
+    await clearStoredDirectoryHandle();
+    state.saveDirectoryHandle = null;
+    updateFolderStatus();
+  }
+
+  return promptForSaveDirectory();
+}
+
+async function promptForSaveDirectory() {
+  if (!window.showDirectoryPicker) {
+    elements.folderStatus.textContent = 'Direct folder access is not supported in this browser.';
+    elements.recordingMessage.textContent = 'This browser saves files through its normal download flow.';
+    return null;
+  }
+
+  try {
+    const directoryHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    const permission = await verifyDirectoryPermission(directoryHandle, true);
+    if (permission !== 'granted') {
+      elements.recordingMessage.textContent = 'Folder access was not granted.';
+      return null;
+    }
+
+    state.saveDirectoryHandle = directoryHandle;
+    await setStoredDirectoryHandle(directoryHandle);
+    updateFolderStatus();
+    elements.recordingMessage.textContent = `Files will be saved to the ${directoryHandle.name} folder.`;
+    return directoryHandle;
+  } catch (error) {
+    if (error.name !== 'AbortError') {
+      elements.recordingMessage.textContent = 'Could not open the folder picker.';
+      console.error(error);
+    }
+    return null;
   }
 }
 
@@ -408,6 +493,32 @@ function getActiveRecording() {
   return state.recordings.find((entry) => entry.id === state.activeRecordingId) || null;
 }
 
+function createWorkingMediaRecorder(stream) {
+  const mimeType = pickMimeType();
+
+  if (mimeType) {
+    try {
+      return new MediaRecorder(stream, { mimeType });
+    } catch (error) {
+      console.warn(`MediaRecorder rejected mimeType ${mimeType}. Falling back to default settings.`, error);
+    }
+  }
+
+  return new MediaRecorder(stream);
+}
+
+function startMediaRecorder(mediaRecorder) {
+  try {
+    mediaRecorder.start(250);
+  } catch (chunkedStartError) {
+    if (mediaRecorder.state !== 'inactive') {
+      throw chunkedStartError;
+    }
+
+    mediaRecorder.start();
+  }
+}
+
 async function loadPersistedRecordings() {
   const storedValue = localStorage.getItem(STORAGE_KEY);
   if (!storedValue) {
@@ -468,6 +579,128 @@ async function persistRecordings() {
       recordings,
     }),
   );
+}
+
+async function saveRecordingToFolder(fileName, wavBlob) {
+  const fileHandle = await state.saveDirectoryHandle.getFileHandle(fileName, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(wavBlob);
+  await writable.close();
+}
+
+async function restoreSaveDirectoryHandle() {
+  if (!window.showDirectoryPicker) {
+    updateFolderStatus();
+    return;
+  }
+
+  try {
+    const directoryHandle = await getStoredDirectoryHandle();
+    if (!directoryHandle) {
+      updateFolderStatus();
+      return;
+    }
+
+    state.saveDirectoryHandle = directoryHandle;
+    updateFolderStatus(await verifyDirectoryPermission(directoryHandle, false));
+  } catch (error) {
+    state.saveDirectoryHandle = null;
+    updateFolderStatus();
+    console.error(error);
+  }
+}
+
+function updateFolderStatus(permissionState = 'prompt') {
+  if (!window.showDirectoryPicker) {
+    elements.folderStatus.textContent = 'Browser downloads folder';
+    return;
+  }
+
+  if (!state.saveDirectoryHandle) {
+    elements.folderStatus.textContent = 'No saved folder selected';
+    return;
+  }
+
+  if (permissionState === 'granted') {
+    elements.folderStatus.textContent = state.saveDirectoryHandle.name;
+    return;
+  }
+
+  elements.folderStatus.textContent = `${state.saveDirectoryHandle.name} (permission needed)`;
+}
+
+async function verifyDirectoryPermission(directoryHandle, shouldRequest) {
+  const options = { mode: 'readwrite' };
+  if ((await directoryHandle.queryPermission(options)) === 'granted') {
+    return 'granted';
+  }
+
+  if (shouldRequest) {
+    return directoryHandle.requestPermission(options);
+  }
+
+  return 'prompt';
+}
+
+async function setStoredDirectoryHandle(directoryHandle) {
+  const database = await openDatabase();
+  await runTransaction(database, 'readwrite', (store) => store.put(directoryHandle, DIRECTORY_HANDLE_KEY));
+}
+
+async function getStoredDirectoryHandle() {
+  const database = await openDatabase();
+  return runTransaction(database, 'readonly', (store) => store.get(DIRECTORY_HANDLE_KEY));
+}
+
+async function clearStoredDirectoryHandle() {
+  const database = await openDatabase();
+  await runTransaction(database, 'readwrite', (store) => store.delete(DIRECTORY_HANDLE_KEY));
+}
+
+function openDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.addEventListener('upgradeneeded', () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(STORE_NAME)) {
+        database.createObjectStore(STORE_NAME);
+      }
+    });
+
+    request.addEventListener('success', () => {
+      resolve(request.result);
+    });
+
+    request.addEventListener('error', () => {
+      reject(request.error);
+    });
+  });
+}
+
+function runTransaction(database, mode, operation) {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, mode);
+    const store = transaction.objectStore(STORE_NAME);
+    const request = operation(store);
+
+    request.addEventListener('success', () => {
+      resolve(request.result);
+    });
+
+    request.addEventListener('error', () => {
+      reject(request.error);
+    });
+  });
+}
+
+function downloadRecording(fileName, wavBlob) {
+  const exportUrl = URL.createObjectURL(wavBlob);
+  const link = document.createElement('a');
+  link.href = exportUrl;
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(exportUrl);
 }
 
 function blobToDataUrl(blob) {

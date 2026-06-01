@@ -103,7 +103,8 @@ h1 {
 
 .status-detail,
 .recording-message,
-.footnote {
+.footnote,
+.save-destination-text {
   color: rgba(247, 243, 234, 0.72);
 }
 
@@ -155,6 +156,18 @@ button:disabled {
 .history-card {
   display: grid;
   gap: 18px;
+}
+
+.save-destination {
+  display: grid;
+  gap: 10px;
+}
+
+.save-destination-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .history-list {

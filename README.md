@@ -22,6 +22,9 @@ npm run dev
 - Lets the user play any recording directly from its history row.
 - Asks for confirmation before deleting the selected recording or a history item.
 - Saves exported files as `.wav` using the recording start time as the filename.
+- Prompts for a save folder only when one has not already been saved for this browser.
+- Remembers the chosen save folder across browser reloads when the browser supports persisted file handles.
+- Saves `.wav` files directly to the hard drive when the browser supports folder access.
 
 ## Recording history
 
@@ -36,3 +39,9 @@ Browsers do not expose perfectly reliable cross-browser speaker detection. This 
 ## Storage note
 
 Persistent history uses browser storage limits. Very large or many recordings may eventually exceed the available storage in a given browser.
+
+## File saving note
+
+- In browsers that support the File System Access API, the app stores the chosen folder handle in browser storage and reuses it on later loads.
+- If a remembered folder still needs permission, the app asks for that permission when you save again instead of asking for a new path immediately.
+- In browsers that do not support direct folder access, the app falls back to the normal browser download location.
