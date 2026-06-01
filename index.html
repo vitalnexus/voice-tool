@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voice Tool</title>
+    <script type="module" src="/src/main.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <main class="panel">
+        <section class="hero">
+          <p class="eyebrow">Browser Voice Capture</p>
+          <h1>Record dialog, review it instantly, and keep it as WAV.</h1>
+          <p class="lede">
+            This tool checks your audio devices, records from a connected microphone,
+            and lets you play back, delete, or save each recording.
+          </p>
+        </section>
+
+        <section class="status-card" aria-live="polite">
+          <div>
+            <p class="status-label">Audio device status</p>
+            <h2 id="device-status">Checking microphone and speakers...</h2>
+          </div>
+          <p id="device-detail" class="status-detail"></p>
+        </section>
+
+        <section class="controls-card">
+          <div class="button-row">
+            <button id="start-button" class="primary" type="button">Start recording</button>
+            <button id="stop-button" class="secondary" type="button" disabled>Stop recording</button>
+          </div>
+          <div class="meter-wrap">
+            <div class="meter-header">
+              <span>Input level</span>
+              <span id="recording-state">Idle</span>
+            </div>
+            <div class="meter-track" aria-hidden="true">
+              <div id="meter-bar" class="meter-bar"></div>
+            </div>
+          </div>
+          <p id="recording-message" class="recording-message">
+            Press start to begin recording.
+          </p>
+        </section>
+
+        <section class="playback-card">
+          <div class="playback-header">
+            <div>
+              <p class="status-label">Latest recording</p>
+              <h2>Playback and file actions</h2>
+            </div>
+            <span id="recording-length" class="pill">No recording yet</span>
+          </div>
+
+          <audio id="playback-audio" controls preload="metadata"></audio>
+
+          <div class="button-row compact">
+            <button id="play-button" type="button" disabled>Play recording</button>
+            <button id="delete-button" type="button" disabled>Delete recording</button>
+            <button id="save-button" type="button" disabled>Save as WAV</button>
+          </div>
+
+          <p class="footnote">
+            Speaker detection uses browser device information when available. If a browser
+            restricts output device enumeration, playback still uses the default system speakers.
+          </p>
+        </section>
+
+        <section class="history-card">
+          <div class="playback-header">
+            <div>
+              <p class="status-label">Recording history</p>
+              <h2>Saved in this browser</h2>
+            </div>
+            <span id="history-count" class="pill">0 recordings</span>
+          </div>
+
+          <ul id="history-list" class="history-list" aria-live="polite">
+            <li class="history-empty">No recordings yet.</li>
+          </ul>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
