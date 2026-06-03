@@ -11,6 +11,9 @@ const state = {
   stream: null,
   mediaRecorder: null,
   speechRecognition: null,
+  transcriptionWorker: null,
+  transcriptionJobId: 0,
+  transcriptionRequests: new Map(),
   transcriptSupported: Boolean(SpeechRecognition),
   transcriptFinal: '',
   transcriptInterim: '',
@@ -71,63 +74,64 @@ function bindEvents() {
 }
 
 function initializeTranscription() {
-  if (!state.transcriptSupported) {
-    elements.transcriptStatus.textContent = 'Unsupported';
-    elements.transcriptBox.textContent = 'Live transcription is not available in this browser. Chromium usually supports it through the built-in speech recognition service.';
+  if (state.transcriptSupported) {
+    state.speechRecognition = new SpeechRecognition();
+    state.speechRecognition.continuous = true;
+    state.speechRecognition.interimResults = true;
+    state.speechRecognition.lang = 'en-US';
+
+    state.speechRecognition.addEventListener('start', () => {
+      updateTranscriptStatus('Listening');
+    });
+
+    state.speechRecognition.addEventListener('result', (event) => {
+      let interimTranscript = '';
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const text = result[0].transcript.trim();
+        if (!text) {
+          continue;
+        }
+
+        if (result.isFinal) {
+          state.transcriptFinal = `${state.transcriptFinal} ${text}`.trim();
+        } else {
+          interimTranscript = `${interimTranscript} ${text}`.trim();
+        }
+      }
+
+      state.transcriptInterim = interimTranscript;
+      renderTranscript();
+    });
+
+    state.speechRecognition.addEventListener('error', (event) => {
+      state.transcriptError = event.error;
+      updateTranscriptStatus('Error');
+      renderTranscript();
+    });
+
+    state.speechRecognition.addEventListener('end', () => {
+      if (state.mediaRecorder?.state === 'recording') {
+        try {
+          state.speechRecognition.start();
+        } catch (error) {
+          state.transcriptError = error.message;
+          updateTranscriptStatus('Error');
+          renderTranscript();
+        }
+        return;
+      }
+
+      updateTranscriptStatus(getTranscriptText() ? 'Ready' : 'Post-processing');
+    });
+
+    updateTranscriptStatus('Ready');
+    elements.transcriptBox.textContent = 'Transcription will appear here while you speak, or after the recording is complete.';
     return;
   }
 
-  state.speechRecognition = new SpeechRecognition();
-  state.speechRecognition.continuous = true;
-  state.speechRecognition.interimResults = true;
-  state.speechRecognition.lang = 'en-US';
-
-  state.speechRecognition.addEventListener('start', () => {
-    updateTranscriptStatus('Listening');
-  });
-
-  state.speechRecognition.addEventListener('result', (event) => {
-    let interimTranscript = '';
-    for (let index = event.resultIndex; index < event.results.length; index += 1) {
-      const result = event.results[index];
-      const text = result[0].transcript.trim();
-      if (!text) {
-        continue;
-      }
-
-      if (result.isFinal) {
-        state.transcriptFinal = `${state.transcriptFinal} ${text}`.trim();
-      } else {
-        interimTranscript = `${interimTranscript} ${text}`.trim();
-      }
-    }
-
-    state.transcriptInterim = interimTranscript;
-    renderTranscript();
-  });
-
-  state.speechRecognition.addEventListener('error', (event) => {
-    state.transcriptError = event.error;
-    updateTranscriptStatus('Error');
-    renderTranscript();
-  });
-
-  state.speechRecognition.addEventListener('end', () => {
-    if (state.mediaRecorder?.state === 'recording') {
-      try {
-        state.speechRecognition.start();
-      } catch (error) {
-        state.transcriptError = error.message;
-        updateTranscriptStatus('Error');
-        renderTranscript();
-      }
-      return;
-    }
-
-    updateTranscriptStatus(state.transcriptFinal ? 'Ready' : 'Idle');
-  });
-
-  updateTranscriptStatus('Ready');
+  updateTranscriptStatus('Post-recording only');
+  elements.transcriptBox.textContent = 'Live transcription is not available in this browser. The app will transcribe the recording after you stop.';
 }
 
 async function verifyAudioDevices() {
@@ -271,14 +275,17 @@ async function handleStartRecording() {
     const durationMs = Date.now() - state.recordingStartedAt;
     const startedAt = state.recordingStartedAt;
     const blob = new Blob(state.audioChunks, { type: state.mediaRecorder.mimeType });
-    const recording = createRecordingEntry(blob, startedAt, durationMs, state.transcriptFinal);
+    const recording = createRecordingEntry(blob, startedAt, durationMs, getTranscriptText());
 
     state.recordings.unshift(recording);
     selectRecording(recording.id);
     await persistRecordings();
     renderHistory();
-    elements.recordingMessage.textContent = 'Recording ready for playback, deletion, or WAV export.';
+    elements.recordingMessage.textContent = 'Recording captured. Preparing transcript...';
     updateControlsAfterStop(true);
+    transcribeRecording(recording.id).catch((error) => {
+      console.error(error);
+    });
   });
 
   try {
@@ -354,10 +361,20 @@ async function handleSaveRecording() {
       return;
     }
 
+    if (activeRecording.transcriptionState === 'pending') {
+      elements.recordingMessage.textContent = 'Wait for the transcript to finish before saving the WAV and TXT files.';
+      return;
+    }
+
+    if (!activeRecording.transcript) {
+      elements.recordingMessage.textContent = 'No transcript is available yet, so the TXT file cannot be saved.';
+      return;
+    }
+
     const wavBlob = await convertBlobToWav(state.recordedBlob);
     const wavFileName = `${activeRecording.fileLabel}.wav`;
     const textFileName = `${activeRecording.fileLabel}.txt`;
-    const textBlob = new Blob([activeRecording.transcript || ''], { type: 'text/plain;charset=utf-8' });
+    const textBlob = new Blob([activeRecording.transcript], { type: 'text/plain;charset=utf-8' });
     const directoryHandle = await ensureSaveDirectoryHandle();
 
     if (directoryHandle) {
@@ -444,11 +461,16 @@ async function promptForSaveDirectory() {
 }
 
 function updateControlsAfterStop(hasRecording) {
+  const activeRecording = getActiveRecording();
+  const canSaveRecording = Boolean(
+    hasRecording && activeRecording && activeRecording.transcriptionState !== 'pending' && activeRecording.transcript,
+  );
+
   elements.startButton.disabled = document.body.dataset.ready !== 'true';
   elements.stopButton.disabled = true;
   elements.playButton.disabled = !hasRecording;
   elements.deleteButton.disabled = !hasRecording;
-  elements.saveButton.disabled = !hasRecording;
+  elements.saveButton.disabled = !canSaveRecording;
 }
 
 function clearRecording() {
@@ -533,6 +555,8 @@ function createRecordingEntry(blob, startedAt, durationMs, transcript = '') {
     fileLabel: formatRecordingFilename(startedAt),
     durationLabel: formatDuration(durationMs),
     transcript,
+    transcriptError: '',
+    transcriptionState: transcript ? 'complete' : 'pending',
     savedFiles: null,
   };
 }
@@ -550,10 +574,21 @@ function selectRecording(id) {
   state.recordedUrl = recording.url;
   elements.playbackAudio.src = recording.url;
   elements.recordingLength.textContent = recording.durationLabel;
-  showTranscript(recording.transcript);
+
+  if (recording.transcriptionState === 'pending') {
+    updateTranscriptStatus('Transcribing');
+    elements.transcriptBox.textContent = 'Transcribing the recorded audio. The first run can take a while while the model downloads.';
+  } else if (recording.transcriptionState === 'error') {
+    updateTranscriptStatus('Error');
+    elements.transcriptBox.textContent = recording.transcriptError || 'Transcription failed for this recording.';
+  } else {
+    showTranscript(recording.transcript);
+  }
+
   if (recording.savedFiles) {
     elements.recordingMessage.textContent = `Saved files: ${recording.savedFiles.wavFileName} and ${recording.savedFiles.textFileName}.`;
   }
+
   renderHistory();
 }
 
@@ -592,11 +627,18 @@ function renderHistory() {
   elements.historyList.innerHTML = state.recordings
     .map((recording) => {
       const isActive = recording.id === state.activeRecordingId;
+      const statusSuffix =
+        recording.transcriptionState === 'pending'
+          ? ' • transcribing'
+          : recording.transcriptionState === 'error'
+            ? ' • transcript failed'
+            : '';
+
       return `
         <li class="history-item${isActive ? ' active' : ''}">
           <div>
             <p class="history-title">${recording.displayName}</p>
-            <p class="history-meta">Length ${recording.durationLabel}</p>
+            <p class="history-meta">Length ${recording.durationLabel}${statusSuffix}</p>
           </div>
           <div class="button-row compact history-actions">
             <button type="button" data-action="play" data-id="${recording.id}">Play</button>
@@ -682,6 +724,8 @@ async function loadPersistedRecordings() {
           fileLabel: formatRecordingFilename(recording.startedAt),
           durationLabel: formatDuration(recording.durationMs),
           transcript: recording.transcript || '',
+          transcriptError: recording.transcriptError || '',
+          transcriptionState: recording.transcriptionState || (recording.transcript ? 'complete' : 'pending'),
           savedFiles: recording.savedFiles || null,
         };
       }),
@@ -713,6 +757,8 @@ async function persistRecordings() {
       startedAt: recording.startedAt,
       durationMs: recording.durationMs,
       transcript: recording.transcript || '',
+      transcriptError: recording.transcriptError || '',
+      transcriptionState: recording.transcriptionState || 'pending',
       savedFiles: recording.savedFiles || null,
       dataUrl: await blobToDataUrl(recording.blob),
     })),
@@ -725,6 +771,146 @@ async function persistRecordings() {
       recordings,
     }),
   );
+}
+
+async function transcribeRecording(recordingId) {
+  const recording = state.recordings.find((entry) => entry.id === recordingId);
+  if (!recording) {
+    return;
+  }
+
+  recording.transcriptionState = 'pending';
+  recording.transcriptError = '';
+
+  if (state.activeRecordingId === recordingId) {
+    updateTranscriptStatus('Transcribing');
+    elements.transcriptBox.textContent = 'Transcribing the recorded audio. The first run can take a while while the model downloads.';
+    updateControlsAfterStop(true);
+  }
+
+  try {
+    const { audioData, sampleRate } = await decodeAudioForTranscription(recording.blob);
+    const transcript = await requestTranscription(audioData, sampleRate);
+    const normalizedTranscript = transcript.trim() || recording.transcript;
+
+    if (!normalizedTranscript) {
+      throw new Error('No transcript could be generated from this recording.');
+    }
+
+    recording.transcript = normalizedTranscript;
+    recording.transcriptionState = 'complete';
+    recording.transcriptError = '';
+
+    if (state.activeRecordingId === recordingId) {
+      showTranscript(recording.transcript);
+      updateControlsAfterStop(true);
+      elements.recordingMessage.textContent = 'Recording ready for playback, deletion, or WAV + TXT export.';
+    }
+  } catch (error) {
+    if (recording.transcript) {
+      recording.transcriptionState = 'complete';
+      recording.transcriptError = '';
+      if (state.activeRecordingId === recordingId) {
+        showTranscript(recording.transcript);
+        updateControlsAfterStop(true);
+        elements.recordingMessage.textContent = 'Recording saved its live transcript. Post-recording transcription failed.';
+      }
+    } else {
+      recording.transcriptionState = 'error';
+      recording.transcriptError = error.message || 'Transcription failed for this recording.';
+      if (state.activeRecordingId === recordingId) {
+        updateTranscriptStatus('Error');
+        elements.transcriptBox.textContent = recording.transcriptError;
+        updateControlsAfterStop(true);
+      }
+    }
+  }
+
+  renderHistory();
+  await persistRecordings();
+}
+
+async function decodeAudioForTranscription(blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const Context = window.AudioContext || window.webkitAudioContext;
+  const audioContext = new Context();
+  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+  const monoAudio = new Float32Array(audioBuffer.length);
+  for (let channelIndex = 0; channelIndex < audioBuffer.numberOfChannels; channelIndex += 1) {
+    const channelData = audioBuffer.getChannelData(channelIndex);
+    for (let sampleIndex = 0; sampleIndex < channelData.length; sampleIndex += 1) {
+      monoAudio[sampleIndex] += channelData[sampleIndex] / audioBuffer.numberOfChannels;
+    }
+  }
+
+  await audioContext.close();
+  return {
+    audioData: monoAudio,
+    sampleRate: audioBuffer.sampleRate,
+  };
+}
+
+async function requestTranscription(audioData, sampleRate) {
+  await ensureTranscriptionWorker();
+  const jobId = ++state.transcriptionJobId;
+
+  return new Promise((resolve, reject) => {
+    state.transcriptionRequests.set(jobId, { resolve, reject });
+    state.transcriptionWorker.postMessage(
+      {
+        type: 'transcribe',
+        jobId,
+        audioData,
+        sampleRate,
+      },
+      [audioData.buffer],
+    );
+  });
+}
+
+async function ensureTranscriptionWorker() {
+  if (state.transcriptionWorker) {
+    return;
+  }
+
+  state.transcriptionWorker = new Worker(new URL('./transcriptionWorker.js', import.meta.url), {
+    type: 'module',
+  });
+
+  state.transcriptionWorker.addEventListener('message', ({ data }) => {
+    if (data.type === 'status') {
+      if (state.activeRecordingId) {
+        updateTranscriptStatus(data.status);
+        if (data.message) {
+          elements.transcriptBox.textContent = data.message;
+        }
+      }
+      return;
+    }
+
+    const request = state.transcriptionRequests.get(data.jobId);
+    if (!request) {
+      return;
+    }
+
+    state.transcriptionRequests.delete(data.jobId);
+    if (data.type === 'result') {
+      request.resolve(data.text || '');
+      return;
+    }
+
+    if (data.type === 'error') {
+      request.reject(new Error(data.message || 'Transcription failed.'));
+    }
+  });
+
+  state.transcriptionWorker.addEventListener('error', (error) => {
+    for (const request of state.transcriptionRequests.values()) {
+      request.reject(error);
+    }
+    state.transcriptionRequests.clear();
+  });
 }
 
 async function saveBlobToFolder(fileName, blob) {
@@ -902,8 +1088,8 @@ function runTransaction(database, mode, operation) {
   });
 }
 
-function downloadRecording(fileName, wavBlob) {
-  const exportUrl = URL.createObjectURL(wavBlob);
+function downloadRecording(fileName, blob) {
+  const exportUrl = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = exportUrl;
   link.download = fileName;
@@ -959,7 +1145,8 @@ function renderMeter() {
 
 function startTranscription() {
   if (!state.speechRecognition) {
-    updateTranscriptStatus('Unsupported');
+    updateTranscriptStatus('Recording');
+    elements.transcriptBox.textContent = 'Recording now. Transcript will be generated after you stop.';
     return;
   }
 
@@ -988,7 +1175,7 @@ function resetTranscript() {
   state.transcriptFinal = '';
   state.transcriptInterim = '';
   state.transcriptError = '';
-  updateTranscriptStatus(state.speechRecognition ? 'Ready' : 'Unsupported');
+  updateTranscriptStatus(state.speechRecognition ? 'Ready' : 'Post-recording only');
   renderTranscript();
 }
 
@@ -998,18 +1185,29 @@ function renderTranscript() {
     return;
   }
 
-  const transcript = [state.transcriptFinal, state.transcriptInterim].filter(Boolean).join(' ');
-  elements.transcriptBox.textContent = transcript || 'Listening for speech...';
+  const transcript = getTranscriptText();
+  if (transcript) {
+    elements.transcriptBox.textContent = transcript;
+    return;
+  }
+
+  elements.transcriptBox.textContent = state.speechRecognition
+    ? 'Listening for speech...'
+    : 'Recording now. Transcript will be generated after you stop.';
+}
+
+function getTranscriptText() {
+  return [state.transcriptFinal, state.transcriptInterim].filter(Boolean).join(' ').trim();
 }
 
 function clearTranscriptDisplay() {
   elements.transcriptBox.textContent = 'Transcription will appear here while you speak, or after the recording is complete.';
-  updateTranscriptStatus(state.speechRecognition ? 'Ready' : 'Unsupported');
+  updateTranscriptStatus(state.speechRecognition ? 'Ready' : 'Post-recording only');
 }
 
 function showTranscript(transcript) {
   elements.transcriptBox.textContent = transcript || 'No transcript was captured for this recording.';
-  updateTranscriptStatus(transcript ? 'Ready' : state.speechRecognition ? 'Idle' : 'Unsupported');
+  updateTranscriptStatus(transcript ? 'Ready' : state.speechRecognition ? 'Idle' : 'Post-recording only');
 }
 
 function updateTranscriptStatus(status) {

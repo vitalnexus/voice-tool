@@ -4,6 +4,8 @@ Browser-based voice recording tool with continuous recording, live transcription
 
 ## Run locally
 
+
+Browser-based voice recording tool with continuous recording, live preview transcription, post-recording speech-to-text, instant playback, persistent history, delete confirmation, and WAV/TXT export.
 ```bash
 npm install
 npm run dev
@@ -48,6 +50,9 @@ Browsers do not expose perfectly reliable cross-browser speaker detection. This 
 ## Storage note
 
 Persistent history uses browser storage limits. Very large or many recordings may eventually exceed the available storage in a given browser.
+- After recording stops, the app also runs a browser-side Whisper transcription pass to generate the final text.
+- The first transcription run downloads the model into the browser cache, so it is slower than later runs.
+- Saving the WAV and TXT files is disabled until the transcript is ready.
 
 ## File saving note
 
